@@ -21,4 +21,7 @@ bin/%.so: src/%.c
 clean::
 	(rm -f $(TARGETS) && rm -f bin/* && find . -name "*\.so" -o -name "*\.o" -o -name "*\.d" -o -name "*\.log" -o -name "*\.dat" -o -name "*\.eps" | xargs rm -f)
 
+tests:: $(TARGETS) bin/log-packets.so
+	(./tests/run.sh)
+
 -include $(wildcard *.d)
