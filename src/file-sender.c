@@ -15,7 +15,7 @@ ssize_t send_data_packet(int sockfd, struct data_pkt_t *data_pkt, size_t len, st
 	printf("Sender: Sending segment %d, size %ld.\n", ntohl(data_pkt->seq_num), len);
 
 	if (sent_len != len) {
-		fprintf(stderr, "Truncated packet.\n");
+		fprintf(stderr, "Sender: Truncated packet.\n");
 		exit(-1);
 	}
 
@@ -32,13 +32,21 @@ ssize_t receive_ack_packet(int sockfd, struct ack_pkt_t *ack_pkt, struct sockadd
 	}
 
 	if (received_len != sizeof(*ack_pkt)) {
-		fprintf(stderr, "Truncated packet.\n");
+		fprintf(stderr, "Sender: Truncated packet.\n");
 		exit(-1);
 	}
 
 	printf("Sender: Received ACK segment %d, size %ld.\n", ntohl(ack_pkt->seq_num), received_len);
 
 	return received_len;
+}
+
+int is_outstanding_packet(uint32_t sn, uint32_t sf, uint32_t seq_num) {
+	if (sf < sn) {
+		return sf <= seq_num && seq_num < sn;
+	} else {
+		return sf <= seq_num || seq_num < sn;
+	}
 }
 
 int main(int argc, char *argv[]) {
@@ -50,23 +58,23 @@ int main(int argc, char *argv[]) {
 
 	int port = atoi(argv[1]);
 
-	int window_size = atoi(argv[2]);
-	if (window_size <= 0 || window_size > MAX_WINDOW_SIZE) {
-		fprintf(stderr, "Invalid window size\n");
+	int s_size = atoi(argv[2]);
+	if (s_size <= 0 || s_size > MAX_WINDOW_SIZE) {
+		fprintf(stderr, "Sender: Invalid window size.\n");
 		exit(EXIT_FAILURE);
 	}
 
 	// Prepare server socket.
 	int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockfd == -1) {
-		fprintf(stderr, "Failed to prepare server socket\n");
+		fprintf(stderr, "Sender: Failed to prepare server socket.\n");
 		exit(EXIT_FAILURE);
 	}
 
 	// Allow address reuse so we can rebind to the same port,
 	// after restarting the server.
 	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0) {
-		fprintf(stderr, "Failed to allow address reuse\n");
+		fprintf(stderr, "Sender: Failed to allow address reuse.\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -78,14 +86,14 @@ int main(int argc, char *argv[]) {
 	if (bind(sockfd, (struct sockaddr *)&srv_addr, sizeof(srv_addr))) {
 		exit(EXIT_FAILURE);
 	}
-	fprintf(stderr, "Receiving on port: %d\n", port);
+	fprintf(stderr, "Sender: Receiving on port: %d.\n", port);
 
 	ssize_t len;
-	struct sockaddr_in src_addr;
+	struct sockaddr_in client_addr;
 	req_file_pkt_t req_file_pkt;
 
 	// Receive name of file from client.
-	len = recvfrom(sockfd, &req_file_pkt, sizeof(req_file_pkt), 0, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
+	len = recvfrom(sockfd, &req_file_pkt, sizeof(req_file_pkt), 0, (struct sockaddr *)&client_addr, &(socklen_t){sizeof(client_addr)});
 	if (len < MAX_PATH_SIZE) {
 		req_file_pkt.file_path[len] = '\0';
 	}
@@ -93,6 +101,7 @@ int main(int argc, char *argv[]) {
 
 	FILE *file = fopen(req_file_pkt.file_path, "r");
 	if (!file) {
+		fprintf(stderr, "Sender: Failed to open file.\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -101,40 +110,52 @@ int main(int argc, char *argv[]) {
 	tv.tv_sec = TIMEOUT / 1000;
 	tv.tv_usec = (TIMEOUT % 1000) * 1000;
 	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
-		fprintf(stderr, "Failed to set timeout\n");
+		fprintf(stderr, "Sender: Failed to set timeout.\n");
 		exit(EXIT_FAILURE);
 	}
 
-	uint32_t seq_num = 0;
+	uint32_t sf = 0;
+	uint32_t sn = 0;
 
-	data_pkt_t data_pkt;
+	data_pkt_t data_pkts[SEQ_NUM_SIZE];
 	ack_pkt_t ack_pkt;
 	size_t data_len;
 	size_t received_len;
 
 	// Generate segments from file, until the end of the file.
 	do {
-		// Send data segment.
-		data_pkt.seq_num = htonl(seq_num);
-		data_len = fread(data_pkt.data, 1, sizeof(data_pkt.data), file);
-		send_data_packet(sockfd, &data_pkt, offsetof(data_pkt_t, data) + data_len, (struct sockaddr *)&src_addr);
 
-		// Wait for ACK and resend if timeout.
+		// Send segments until the window is full.
+		while (sn != (sf + s_size) % SEQ_NUM_SIZE) {
+			data_pkts[sn].seq_num = htonl(sn);
+			data_len = fread(data_pkts[sn].data, 1, sizeof(data_pkts[sn].data), file);
+			send_data_packet(sockfd, &data_pkts[sn], offsetof(data_pkt_t, data) + data_len, (struct sockaddr *)&client_addr);
+
+			sn = (sn + 1) % SEQ_NUM_SIZE;
+		}
+
+		// Wait for ACK and resend all outstanding packets if timeout.
 		do {
-			received_len = receive_ack_packet(sockfd, &ack_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
+			received_len = receive_ack_packet(sockfd, &ack_pkt, (struct sockaddr *)&client_addr, &(socklen_t){sizeof(client_addr)});
+
+			// Timeout
 			if (received_len == -1) {
-				fprintf(stderr, "Timeout, resending segment %d\n", ntohl(data_pkt.seq_num));
-				send_data_packet(sockfd, &data_pkt, offsetof(data_pkt_t, data) + data_len, (struct sockaddr *)&src_addr);
+				for (uint32_t i = sf; i < sn; i++) {
+					fprintf(stderr, "Sender: Timeout - Resending segment %d.\n", ntohl(data_pkts[i].seq_num));
+					send_data_packet(sockfd, &data_pkts[i], offsetof(data_pkt_t, data) + data_len, (struct sockaddr *)&client_addr);
+				}
 			}
-		} while (received_len == -1 || ntohl(ack_pkt.seq_num) != (seq_num + 1) % MAX_WINDOW_SIZE);
 
-		seq_num = (seq_num + 1) % MAX_WINDOW_SIZE;
+		} while (received_len == -1 && !is_outstanding_packet(sf, sn, ntohl(ack_pkt.seq_num)));
 
-	} while (!(feof(file) && data_len < sizeof(data_pkt.data)));
+		sf = ntohl(ack_pkt.seq_num);
+
+	} while (!(feof(file) && data_len < sizeof(data_pkts[0].data)));
 
 	// Clean up and exit.
 	close(sockfd);
 	fclose(file);
+	fprintf(stderr, "Sender: Closed socket.\n");
 
 	return 0;
 }

@@ -64,7 +64,7 @@ int main(int argc, char *argv[]) {
 
 	int window_size = atoi(argv[4]);
 	if (window_size < 1 || window_size > MAX_WINDOW_SIZE) {
-		fprintf(stderr, "Invalid window size\n");
+		fprintf(stderr, "Receiver: Invalid window size.\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -104,7 +104,7 @@ int main(int argc, char *argv[]) {
 
 	ssize_t sent_len = sendto(sockfd, &req_file_pkt, file_path_len, 0, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
 	if (sent_len != file_path_len) {
-		fprintf(stderr, "Truncated packet.\n");
+		fprintf(stderr, "Receiver: Truncated packet.\n");
 		exit(EXIT_FAILURE);
 	}
 	printf("Sending request for file %s, size %ld.\n", file_path, file_path_len);
@@ -114,7 +114,7 @@ int main(int argc, char *argv[]) {
 	tv.tv_sec = 4;
 	tv.tv_usec = 0;
 	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
-		fprintf(stderr, "Failed to set timeout\n");
+		fprintf(stderr, "Receiver: Failed to set timeout.\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -130,22 +130,17 @@ int main(int argc, char *argv[]) {
 		// Receive data packet.
 		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
 		if (received_len == -1) {
-			fprintf(stderr, "Receiver timeout has been reached\n");
+			fprintf(stderr, "Receiver: Timeout has been reached.\n");
 			fclose(file);
 			exit(EXIT_FAILURE);
 		}
 
-		// Corrupted packet
-		/* if (received_len != sizeof(data_pkt_t)) {
-		        continue;
-		} */
-
 		// Write new packet data to file.
-		// If seq_num != data_pkt.seq_num the packet is duplicated and we need to
-		// send an ACK
+		// If seq_num != data_pkt.seq_num the packet is duplicated and
+		// we need to send an ACK
 		if (seq_num == ntohl(data_pkt.seq_num)) {
 			fwrite(data_pkt.data, 1, received_len - offsetof(data_pkt_t, data), file);
-			seq_num = (seq_num + 1) % MAX_WINDOW_SIZE;
+			seq_num = (seq_num + 1) % SEQ_NUM_SIZE;
 		}
 
 		// Send ACK
@@ -158,6 +153,7 @@ int main(int argc, char *argv[]) {
 	// Clean up and exit.
 	close(sockfd);
 	fclose(file);
+	fprintf(stderr, "Receiver: Closing socket.\n");
 
 	return 0;
 }
