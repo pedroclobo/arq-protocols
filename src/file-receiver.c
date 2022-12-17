@@ -8,6 +8,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#define RESET "\033[0m"
+#define GREEN "\033[32m"
+
 int find_last_path_separator(char *path) {
 	int last_found_pos = -1;
 	int curr_pos = 0;
@@ -32,7 +35,7 @@ ssize_t send_ack_packet(int sockfd, struct ack_pkt_t *ack_pkt, size_t len, struc
 		exit(-1);
 	}
 
-	printf("Receiver: Sent ACK segment %d, size %ld.\n", ntohl(ack_pkt->seq_num), sent_len);
+	printf(GREEN "Receiver: " RESET "Sent ACK with seq_num %d and selective_acks %b.\n", ntohl(ack_pkt->seq_num), ntohl(ack_pkt->selective_acks));
 
 	return sent_len;
 }
@@ -46,9 +49,16 @@ ssize_t receive_data_packet(int sockfd, struct data_pkt_t *data_pkt, struct sock
 		return 0;
 	}
 
-	printf("Receiver: Received segment %d, size %ld.\n", ntohl(data_pkt->seq_num), received_len);
+	printf(GREEN "Receiver: " RESET "Received segment %d, size %ld.\n", ntohl(data_pkt->seq_num), received_len);
 
 	return received_len;
+}
+
+int is_inside_window(uint32_t rn, uint32_t r_size, uint32_t seq_num) { return rn <= seq_num && seq_num < rn + r_size; }
+
+int has_been_received(uint32_t seq_num, uint32_t rn, uint32_t selective_acks) {
+	int mask = 1 << (seq_num - rn - 1);
+	return (selective_acks & mask) == mask;
 }
 
 int main(int argc, char *argv[]) {
@@ -62,8 +72,8 @@ int main(int argc, char *argv[]) {
 	char *host = argv[2];
 	int port = atoi(argv[3]);
 
-	int window_size = atoi(argv[4]);
-	if (window_size < 1 || window_size > MAX_WINDOW_SIZE) {
+	int r_size = atoi(argv[4]);
+	if (r_size < 1 || r_size > MAX_WINDOW_SIZE) {
 		fprintf(stderr, "Receiver: Invalid window size.\n");
 		exit(EXIT_FAILURE);
 	}
@@ -118,10 +128,12 @@ int main(int argc, char *argv[]) {
 		exit(EXIT_FAILURE);
 	}
 
-	uint32_t seq_num = 0;
+	uint32_t rn = 0;
+	uint32_t selective_acks = 0;
 
 	ssize_t received_len;
 	data_pkt_t data_pkt;
+	data_pkt_t data_pkts[SEQ_NUM_SIZE];
 	ack_pkt_t ack_pkt;
 	struct sockaddr_in src_addr;
 
@@ -129,24 +141,55 @@ int main(int argc, char *argv[]) {
 	do {
 		// Receive data packet.
 		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
-		if (received_len == -1) {
-			fprintf(stderr, "Receiver: Timeout has been reached.\n");
-			fclose(file);
-			exit(EXIT_FAILURE);
-		}
+		// if (received_len == -1) {
+		// 	fprintf(stderr, "Receiver: Timeout has been reached.\n");
+		// 	fclose(file);
+		// 	exit(EXIT_FAILURE);
+		// }
 
-		// Write new packet data to file.
-		// If seq_num != data_pkt.seq_num the packet is duplicated and
-		// we need to send an ACK
-		if (seq_num == ntohl(data_pkt.seq_num)) {
-			fwrite(data_pkt.data, 1, received_len - offsetof(data_pkt_t, data), file);
-			seq_num = (seq_num + 1) % SEQ_NUM_SIZE;
-		}
+		// packet outside window arrived
+		// discard it and resend ack with seq_num = rn
+		if (!is_inside_window(rn, r_size, ntohl(data_pkt.seq_num))) {
+			ack_pkt.seq_num = htonl(rn);
+			ack_pkt.selective_acks = htonl(selective_acks);
+			sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
 
-		// Send ACK
-		ack_pkt.seq_num = htonl(seq_num);
-		ack_pkt.selective_acks = 0; // TODO
-		sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
+		// packet inside window arrived
+		} else {
+			if (ntohl(data_pkt.seq_num) == rn) {
+				// update window
+				ack_pkt.seq_num = htonl((rn + 1) % SEQ_NUM_SIZE);
+				ack_pkt.selective_acks = htonl(selective_acks >> 1);
+				sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
+
+				data_pkts[rn] = data_pkt;
+
+				// write packets to file
+				do {
+					fwrite(data_pkts[rn].data, 1, received_len - sizeof(data_pkt.seq_num), file);
+					selective_acks >>= 1;
+					rn = (rn + 1) % SEQ_NUM_SIZE;
+				} while (has_been_received(rn, rn, selective_acks));
+
+			} else {
+				if (!has_been_received(ntohl(data_pkt.seq_num), rn, selective_acks)) {
+					// Mark as received.
+					// Send ACK.
+					ack_pkt.seq_num = htonl(rn);
+					selective_acks |= 1 << (ntohl(data_pkt.seq_num) - rn - 1);
+					ack_pkt.selective_acks = htonl(selective_acks);
+					sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
+
+					// Store packet.
+					data_pkts[ntohl(data_pkt.seq_num)] = data_pkt;
+				} else {
+					// Send ACK.
+					ack_pkt.seq_num = htonl(rn);
+					ack_pkt.selective_acks = htonl(selective_acks);
+					sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
+				}
+			}
+		}
 
 	} while (received_len == sizeof(data_pkt_t));
 

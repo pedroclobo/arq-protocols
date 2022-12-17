@@ -10,9 +10,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define RED "\033[31m"
+#define RESET "\033[0m"
+
 ssize_t send_data_packet(int sockfd, struct data_pkt_t *data_pkt, size_t len, struct sockaddr *src_addr) {
 	size_t sent_len = sendto(sockfd, data_pkt, len, 0, src_addr, sizeof(*src_addr));
-	printf("Sender: Sending segment %d, size %ld.\n", ntohl(data_pkt->seq_num), len);
+	printf(RED "Sender: " RESET "Sending segment %d, size %ld.\n", ntohl(data_pkt->seq_num), len);
 
 	if (sent_len != len) {
 		fprintf(stderr, "Sender: Truncated packet.\n");
@@ -36,7 +39,7 @@ ssize_t receive_ack_packet(int sockfd, struct ack_pkt_t *ack_pkt, struct sockadd
 		exit(-1);
 	}
 
-	printf("Sender: Received ACK segment %d, size %ld.\n", ntohl(ack_pkt->seq_num), received_len);
+	printf(RED "Sender: " RESET "Received ACK with seq_num %d and selective_acks %b.\n", ntohl(ack_pkt->seq_num), ntohl(ack_pkt->selective_acks));
 
 	return received_len;
 }
@@ -47,6 +50,15 @@ int is_outstanding_packet(uint32_t sn, uint32_t sf, uint32_t seq_num) {
 	} else {
 		return sf <= seq_num || seq_num < sn;
 	}
+}
+
+bool has_been_received(uint32_t seq_num, uint32_t rn, uint32_t selective_acks) {
+	if (seq_num == rn) {
+		return false;
+	}
+
+	int mask = 1 << (seq_num - rn - 1);
+	return (selective_acks & mask) == mask;
 }
 
 int main(int argc, char *argv[]) {
@@ -118,7 +130,10 @@ int main(int argc, char *argv[]) {
 	uint32_t sn = 0;
 
 	data_pkt_t data_pkts[SEQ_NUM_SIZE];
+
+	bool ack = false; // did i receive an ACK before?
 	ack_pkt_t ack_pkt;
+
 	size_t data_len;
 	size_t received_len;
 
@@ -134,21 +149,33 @@ int main(int argc, char *argv[]) {
 			sn = (sn + 1) % SEQ_NUM_SIZE;
 		}
 
-		// Wait for ACK and resend all outstanding packets if timeout.
-		do {
-			received_len = receive_ack_packet(sockfd, &ack_pkt, (struct sockaddr *)&client_addr, &(socklen_t){sizeof(client_addr)});
+		// Receive ACK and resend outstanding packets if timeout.
+		received_len = receive_ack_packet(sockfd, &ack_pkt, (struct sockaddr *)&client_addr, &(socklen_t){sizeof(client_addr)});
 
-			// Timeout
-			if (received_len == -1) {
+		// Timeout
+		if (received_len == -1) {
+			// If we didn't receive an ACK before, we resend all outstanding packets.
+			if (!ack) {
 				for (uint32_t i = sf; i < sn; i++) {
 					fprintf(stderr, "Sender: Timeout - Resending segment %d.\n", ntohl(data_pkts[i].seq_num));
 					send_data_packet(sockfd, &data_pkts[i], offsetof(data_pkt_t, data) + data_len, (struct sockaddr *)&client_addr);
 				}
+			// We send only the first non received packet
+			} else {
+				for (uint32_t i = sf; i < sn; i++) {
+					if (!has_been_received(i, ntohl(ack_pkt.seq_num), ntohl(ack_pkt.selective_acks))) {
+						fprintf(stderr, "Sender: Timeout - Resending segment %d.\n", ntohl(data_pkts[i].seq_num));
+						send_data_packet(sockfd, &data_pkts[i], offsetof(data_pkt_t, data) + data_len, (struct sockaddr *)&client_addr);
+						break;
+					}
+				}
 			}
-
-		} while (received_len == -1 && !is_outstanding_packet(sf, sn, ntohl(ack_pkt.seq_num)));
-
-		sf = ntohl(ack_pkt.seq_num);
+		} else {
+			sf = ntohl(ack_pkt.seq_num);
+			// while (has_been_received(ntohl(ack_pkt.seq_num), sf, ntohl(ack_pkt.selective_acks))) {
+			// 	sf = (sf + 1) % SEQ_NUM_SIZE;
+			// }
+		}
 
 	} while (!(feof(file) && data_len < sizeof(data_pkts[0].data)));
 
