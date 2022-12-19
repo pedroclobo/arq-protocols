@@ -5,7 +5,7 @@
 #define MAX_RETRIES 3
 #define MAX_CHUNK_SIZE 1000
 #define MAX_PATH_SIZE 4096
-#define SEQ_NUM_SIZE (MAX_WINDOW_SIZE << 1)
+#define SEQ_NUM_SIZE (MAX_WINDOW_SIZE * 2)
 
 typedef struct __attribute__((__packed__)) req_file_pkt_t {
 	char file_path[MAX_PATH_SIZE];
