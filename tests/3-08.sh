@@ -11,7 +11,7 @@ FILE_RECEIVER=$(realpath ./bin/file-receiver)
 
 LD_PRELOAD="$LOG_PACKETS" \
 PACKET_LOG="sender-packets.log" \
-DROP_PATTERN="" \
+DROP_PATTERN="0110110" \
 $FILE_SENDER 1234 32 > /dev/null 2>&1 &
 
 SENDER_PID=$!
@@ -20,8 +20,8 @@ sleep .1
 pushd /tmp > /dev/null
 	LD_PRELOAD="$LOG_PACKETS" \
 	PACKET_LOG="receiver-packets.log" \
-	DROP_PATTERN="" \
-	$FILE_RECEIVER send.dat localhost 1234 1 > /dev/null 2>&1 || true
+	DROP_PATTERN="001101" \
+	$FILE_RECEIVER send.dat localhost 1234 32 > /dev/null 2>&1 || true
 popd > /dev/null
 
 wait $SENDER_PID || true

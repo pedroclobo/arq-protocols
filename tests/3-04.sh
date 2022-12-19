@@ -21,7 +21,7 @@ pushd /tmp > /dev/null
 	LD_PRELOAD="$LOG_PACKETS" \
 	PACKET_LOG="receiver-packets.log" \
 	DROP_PATTERN="" \
-	$FILE_RECEIVER send.dat localhost 1234 1 > /dev/null 2>&1 || true
+	$FILE_RECEIVER send.dat localhost 1234 32 > /dev/null 2>&1 || true
 popd > /dev/null
 
 wait $SENDER_PID || true
