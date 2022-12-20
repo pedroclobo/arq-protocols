@@ -14,9 +14,16 @@
 #define RESET "\033[0m"
 #define SENDER RED " [Sender]:  " RESET
 
-ssize_t send_data_packet(int sockfd, struct data_pkt_t *data_pkt, size_t len, struct sockaddr *src_addr) {
-	size_t sent_len = sendto(sockfd, data_pkt, len, 0, src_addr, sizeof(*src_addr));
-	printf(SENDER "Sending segment %d, size %ld.\n", ntohl(data_pkt->seq_num), len);
+struct window_t {
+	uint32_t base;
+	uint32_t next_seq_num;
+	short size;
+};
+
+ssize_t send_data_pkt(int sockfd, struct data_pkt *data_pkt, struct sockaddr *src_addr) {
+	size_t len = offsetof(data_pkt_t, data) + data_pkt->len;
+	size_t sent_len = sendto(sockfd, &data_pkt->pkt, len, 0, src_addr, sizeof(*src_addr));
+	printf(SENDER "Sending segment %d, size %ld.\n", ntohl(data_pkt->pkt.seq_num), len);
 
 	if (sent_len != len) {
 		fprintf(stderr, SENDER "Truncated packet.\n");
@@ -26,18 +33,16 @@ ssize_t send_data_packet(int sockfd, struct data_pkt_t *data_pkt, size_t len, st
 	return sent_len;
 }
 
-ssize_t receive_ack_packet(int sockfd, struct ack_pkt_t *ack_pkt, struct sockaddr *src_addr, socklen_t *src_addr_len) {
-	ssize_t received_len = recvfrom(sockfd, ack_pkt, sizeof(*ack_pkt), 0, src_addr, src_addr_len);
+ssize_t recv_ack_pkt(int sockfd, struct ack_pkt_t *ack_pkt, struct sockaddr *src_addr) {
+	ssize_t received_len = recvfrom(sockfd, ack_pkt, sizeof(*ack_pkt), 0, src_addr, &(socklen_t){sizeof(*src_addr)});
 
 	if (received_len == -1) {
 		return -1;
 	} else if (received_len == 0) {
 		return 0;
-	}
-
-	if (received_len != sizeof(*ack_pkt)) {
+	} else if (received_len != sizeof(*ack_pkt)) {
 		fprintf(stderr, SENDER "Truncated packet.\n");
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 
 	printf(SENDER "Received ACK with seq_num %d and selective_acks %b.\n", ntohl(ack_pkt->seq_num), ntohl(ack_pkt->selective_acks));
@@ -45,11 +50,11 @@ ssize_t receive_ack_packet(int sockfd, struct ack_pkt_t *ack_pkt, struct sockadd
 	return received_len;
 }
 
-int is_outstanding_packet(uint32_t sn, uint32_t sf, uint32_t seq_num) {
-	if (sf < sn) {
-		return sf <= seq_num && seq_num < sn;
+int is_outstanding_packet(struct window_t *window, uint32_t seq_num) {
+	if (window->base < window->next_seq_num) {
+		return window->base <= seq_num && seq_num < window->next_seq_num;
 	} else {
-		return sf <= seq_num || seq_num < sn;
+		return window->base <= seq_num || seq_num < window->next_seq_num;
 	}
 }
 
@@ -63,6 +68,13 @@ bool has_been_received(uint32_t seq_num, uint32_t rn, uint32_t selective_acks) {
 }
 
 int main(int argc, char *argv[]) {
+	// Create sender window.
+	struct window_t window = {
+	    .base = 0,
+	    .next_seq_num = 0,
+	    .size = 0,
+	};
+
 	// Parse command line arguments.
 	if (argc != 3) {
 		fprintf(stderr, SENDER "Usage: %s <port> <window-size>\n", argv[0]);
@@ -71,8 +83,8 @@ int main(int argc, char *argv[]) {
 
 	int port = atoi(argv[1]);
 
-	int s_size = atoi(argv[2]);
-	if (s_size <= 0 || s_size > MAX_WINDOW_SIZE) {
+	window.size = atoi(argv[2]);
+	if (window.size <= 0 || window.size > MAX_WINDOW_SIZE) {
 		fprintf(stderr, SENDER "Invalid window size.\n");
 		exit(EXIT_FAILURE);
 	}
@@ -127,40 +139,33 @@ int main(int argc, char *argv[]) {
 		exit(EXIT_FAILURE);
 	}
 
-	uint32_t sf = 0;
-	uint32_t sn = 0;
-
-	data_pkt_t data_pkts[SEQ_NUM_SIZE];
-	size_t data_pkts_len[SEQ_NUM_SIZE];
-
+	struct data_pkt data_pkts[SEQ_NUM_SIZE];
 	ack_pkt_t ack_pkt;
-	uint32_t rn = 0;
-	uint32_t selective_acks = 0;
-
 	size_t data_len;
 	size_t received_len;
 
 	do {
 		// Send segments while window is not full and end of file has
 		// not been reached.
-		while (sn != (sf + s_size) % SEQ_NUM_SIZE && !feof(file)) {
-			data_pkts[sn].seq_num = htonl(sn);
-			data_len = fread(data_pkts[sn].data, 1, sizeof(data_pkts[sn].data), file);
-			data_pkts_len[sn] = data_len;
-			send_data_packet(sockfd, &data_pkts[sn], offsetof(data_pkt_t, data) + data_len, (struct sockaddr *)&client_addr);
-			sn = (sn + 1) % SEQ_NUM_SIZE;
+		while (window.next_seq_num != (window.base + window.size) % SEQ_NUM_SIZE && !feof(file)) {
+			data_len = fread(data_pkts[window.next_seq_num].pkt.data, 1, sizeof(data_pkts[window.next_seq_num].pkt.data), file);
+
+			data_pkts[window.next_seq_num].pkt.seq_num = htonl(window.next_seq_num);
+			data_pkts[window.next_seq_num].len = data_len;
+			send_data_pkt(sockfd, &data_pkts[window.next_seq_num], (struct sockaddr *)&client_addr);
+
+			window.next_seq_num = (window.next_seq_num + 1) % SEQ_NUM_SIZE;
 		}
 
 		// Receive ACK's until the window base in updated.
 		int timeouts = 0;
-		while (true) {
-			received_len = receive_ack_packet(sockfd, &ack_pkt, (struct sockaddr *)&client_addr, &(socklen_t){sizeof(client_addr)});
+		bool updated = false;
 
-			rn = ntohl(ack_pkt.seq_num);
-			selective_acks = ntohl(ack_pkt.selective_acks);
+		do {
+			received_len = recv_ack_pkt(sockfd, &ack_pkt, (struct sockaddr *)&client_addr);
 
 			if (received_len == -1) {
-				// Exit on 3 consecutive timeouts.
+				// Exit on MAX_RETRIES consecutive timeouts.
 				if (++timeouts == MAX_RETRIES) {
 					fprintf(stderr, SENDER "Exiting: Consecutive timeouts.\n");
 					close(sockfd);
@@ -169,25 +174,29 @@ int main(int argc, char *argv[]) {
 				}
 
 				// Resend all not yet acknowledged outstanding packets.
-				for (uint32_t seq_num = sf; !has_been_received(seq_num, rn, selective_acks) && is_outstanding_packet(sn, sf, seq_num); seq_num = (seq_num + 1) % SEQ_NUM_SIZE) {
-					fprintf(stderr, SENDER "Timeout:\n");
-					send_data_packet(sockfd, &data_pkts[seq_num], offsetof(data_pkt_t, data) + data_pkts_len[seq_num], (struct sockaddr *)&client_addr);
+				for (uint32_t seq_num = window.base; is_outstanding_packet(&window, seq_num); seq_num = (seq_num + 1) % SEQ_NUM_SIZE) {
+					if (!has_been_received(seq_num, ntohl(ack_pkt.seq_num), ntohl(ack_pkt.selective_acks))) {
+						fprintf(stderr, SENDER "Timeout:\n");
+						send_data_pkt(sockfd, &data_pkts[seq_num], (struct sockaddr *)&client_addr);
+					}
 				}
 
 			} else {
 				// Receiver has new base, update window base.
-				if (sf != ntohl(ack_pkt.seq_num)) {
-					sf = ntohl(ack_pkt.seq_num);
-					break;
+				if (window.base != ntohl(ack_pkt.seq_num)) {
+					window.base = ntohl(ack_pkt.seq_num);
+					updated = true;
 				}
 			}
-		}
 
-	} while (!(feof(file) && data_len < sizeof(data_pkts[0].data)) || selective_acks != 0 || sf != sn);
+		} while (!updated);
+
+	} while (!(feof(file) && window.next_seq_num == window.base && ntohl(ack_pkt.seq_num) == window.next_seq_num && htonl(ack_pkt.selective_acks) == 0));
 
 	// Clean up and exit.
 	close(sockfd);
 	fprintf(stderr, SENDER "Closed socket.\n");
+
 	fclose(file);
 	fprintf(stderr, SENDER "Closed file.\n");
 

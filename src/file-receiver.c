@@ -12,6 +12,11 @@
 #define GREEN "\033[32m"
 #define RECEIVER GREEN "[Receiver]: " RESET
 
+struct window_t {
+	uint32_t base;
+	short size;
+};
+
 int find_last_path_separator(char *path) {
 	int last_found_pos = -1;
 	int curr_pos = 0;
@@ -55,12 +60,12 @@ ssize_t receive_data_packet(int sockfd, struct data_pkt_t *data_pkt, struct sock
 	return received_len;
 }
 
-bool is_inside_window(uint32_t rn, uint32_t r_size, uint32_t seq_num) {
-	uint32_t limit = (rn + r_size) % SEQ_NUM_SIZE;
-	if (limit < rn) {
-		return rn <= seq_num || seq_num < limit;
+bool is_inside_window(struct window_t *window, uint32_t seq_num) {
+	uint32_t limit = (window->base + window->size) % SEQ_NUM_SIZE;
+	if (limit < window->base) {
+		return window->base <= seq_num || seq_num < limit;
 	} else {
-		return rn <= seq_num && seq_num < limit;
+		return window->base <= seq_num && seq_num < limit;
 	}
 }
 
@@ -70,6 +75,12 @@ bool has_been_received(uint32_t seq_num, uint32_t rn, uint32_t selective_acks) {
 }
 
 int main(int argc, char *argv[]) {
+	// Create window.
+	struct window_t window = {
+		.base = 0,
+		.size = 0
+	};
+
 	// Parse command line arguments.
 	if (argc != 5) {
 		fprintf(stderr, RECEIVER "Usage: %s <file> <host> <port> <window-size>\n", argv[0]);
@@ -80,8 +91,8 @@ int main(int argc, char *argv[]) {
 	char *host = argv[2];
 	int port = atoi(argv[3]);
 
-	int r_size = atoi(argv[4]);
-	if (r_size < 1 || r_size > MAX_WINDOW_SIZE) {
+	window.size = atoi(argv[4]);
+	if (window.size <= 0 || window.size > MAX_WINDOW_SIZE) {
 		fprintf(stderr, RECEIVER "Invalid window size.\n");
 		exit(EXIT_FAILURE);
 	}
@@ -139,15 +150,18 @@ int main(int argc, char *argv[]) {
 		exit(EXIT_FAILURE);
 	}
 
-	uint32_t rn = 0;
+	struct sockaddr_in src_addr;
+
 	uint32_t selective_acks = 0;
 
 	ssize_t received_len;
 	data_pkt_t data_pkt;
-	data_pkt_t data_pkts[SEQ_NUM_SIZE];
-	size_t data_pkts_len[SEQ_NUM_SIZE];
+	struct data_pkt data_pkts[SEQ_NUM_SIZE];
+
 	ack_pkt_t ack_pkt;
-	struct sockaddr_in src_addr;
+
+	uint32_t last_packet = 0;
+	bool received_eof = false;
 
 	// Iterate over segments, until last the segment is detected.
 	do {
@@ -159,46 +173,50 @@ int main(int argc, char *argv[]) {
 			fclose(file);
 			remove(file_name);
 			exit(EXIT_FAILURE);
+		} else if (received_len != sizeof(data_pkt)) {
+			last_packet = ntohl(data_pkt.seq_num);
+			received_eof = true;
 		}
 
 		// Packet is inside window.
-		if (is_inside_window(rn, r_size, ntohl(data_pkt.seq_num))) {
-			if (ntohl(data_pkt.seq_num) == rn) {
+		if (is_inside_window(&window, ntohl(data_pkt.seq_num))) {
+			if (ntohl(data_pkt.seq_num) == window.base) {
 
 				// Write packet with seq_num = rn to file.
 				fwrite(data_pkt.data, 1, received_len - sizeof(data_pkt.seq_num), file);
-				fprintf(stderr, RECEIVER "Wrote %ld bytes to file, from packet %d.\n", received_len - sizeof(data_pkt.seq_num), rn);
-				rn = (rn + 1) % SEQ_NUM_SIZE;
+				fprintf(stderr, RECEIVER "Wrote %ld bytes to file, from packet %d.\n", received_len - sizeof(data_pkt.seq_num), window.base);
+				window.base = (window.base + 1) % SEQ_NUM_SIZE;
 
 				// Write the following received packets to the file, updating the
 				// window.
 				while ((selective_acks & 1) == 1) {
-					fwrite(data_pkts[rn].data, 1, data_pkts_len[rn] - sizeof(data_pkt.seq_num), file);
-					fprintf(stderr, RECEIVER "Wrote %ld bytes to file, from packet %d.\n", data_pkts_len[rn] - sizeof(data_pkt.seq_num), rn);
+					fwrite(data_pkts[window.base].pkt.data, 1, data_pkts[window.base].len - sizeof(data_pkt.seq_num), file);
+					fprintf(stderr, RECEIVER "Wrote %ld bytes to file, from packet %d.\n", data_pkts[window.base].len - sizeof(data_pkt.seq_num), window.base);
 					selective_acks >>= 1;
-					rn = (rn + 1) % SEQ_NUM_SIZE;
+					window.base = (window.base + 1) % SEQ_NUM_SIZE;
 				}
 
 				selective_acks >>= 1;
 
 			} else {
 				// Mark packet as received and store it.
-				if (!has_been_received(ntohl(data_pkt.seq_num), rn, selective_acks)) {
-					selective_acks |= 1 << (ntohl(data_pkt.seq_num) - rn - 1);
+				if (!has_been_received(ntohl(data_pkt.seq_num), window.base, selective_acks)) {
+					selective_acks |= 1 << (ntohl(data_pkt.seq_num) - window.base - 1);
 
-					data_pkts[ntohl(data_pkt.seq_num)] = data_pkt;
-					data_pkts_len[ntohl(data_pkt.seq_num)] = received_len;
+					data_pkts[ntohl(data_pkt.seq_num)].pkt = data_pkt;
+					data_pkts[ntohl(data_pkt.seq_num)].len = received_len;
 				}
 			}
 		}
 
 		// Send ACK.
-		ack_pkt.seq_num = htonl(rn);
+		ack_pkt.seq_num = htonl(window.base);
 		ack_pkt.selective_acks = htonl(selective_acks);
 		sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
 
-	} while (received_len == sizeof(data_pkt_t) || ntohl(data_pkt.seq_num) != rn - 1 || selective_acks != 0);
+	} while (!(received_eof && window.base == last_packet + 1 && selective_acks == 0));
 
+	// Reset timeout to 2 seconds.
 	tv.tv_sec = 2;
 	tv.tv_usec = 0;
 	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
@@ -206,15 +224,15 @@ int main(int argc, char *argv[]) {
 		exit(EXIT_FAILURE);
 	}
 
-	received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
-	while (received_len != -1) {
+	// Reply to the server while it replies back.
+	while ((received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)}) != -1)) {
 		sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
-		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
 	}
 
 	// Clean up and exit.
 	close(sockfd);
 	fprintf(stderr, RECEIVER "Closed socket.\n");
+
 	fclose(file);
 	fprintf(stderr, RECEIVER "Closed file.\n");
 
