@@ -1,0 +1,9 @@
+stop-and-wait-01:1000:2::1::1
+stop-and-wait-02:1000:2:1:1::1
+stop-and-wait-03:1000:2::1:01:1
+stop-and-wait-04:1000:2:001:1::1
+stop-and-wait-05:1000:2::1:0001:1
+go-back-n-01:1000:3::3::1
+go-back-n-02:1000:3:1:3::1
+go-back-n-03:1000:3:01:3::1
+selective-repeat-01:1000:3::3::3
