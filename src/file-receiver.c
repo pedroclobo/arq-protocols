@@ -58,9 +58,9 @@ ssize_t receive_data_packet(int sockfd, struct data_pkt_t *data_pkt, struct sock
 bool is_inside_window(uint32_t rn, uint32_t r_size, uint32_t seq_num) {
 	uint32_t limit = (rn + r_size) % SEQ_NUM_SIZE;
 	if (limit < rn) {
-		return seq_num >= rn || seq_num < limit;
+		return rn <= seq_num || seq_num < limit;
 	} else {
-		return seq_num >= rn && seq_num < limit;
+		return rn <= seq_num && seq_num < limit;
 	}
 }
 
@@ -132,7 +132,7 @@ int main(int argc, char *argv[]) {
 
 	// Set timeout.
 	struct timeval tv;
-	tv.tv_sec = 2;
+	tv.tv_sec = 4;
 	tv.tv_usec = 0;
 	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
 		fprintf(stderr, RECEIVER "Failed to set timeout.\n");
@@ -154,30 +154,24 @@ int main(int argc, char *argv[]) {
 		// Receive data packet.
 		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
 		if (received_len == -1) {
-			received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
-		}
-		if (received_len == -1) {
 			fprintf(stderr, RECEIVER "Timeout has been reached.\n");
+			close(sockfd);
 			fclose(file);
+			remove(file_name);
 			exit(EXIT_FAILURE);
 		}
 
-		// Packet outside window arrived.
-		// Discard it and resend ACK with seq_num = rn.
-		if (!is_inside_window(rn, r_size, ntohl(data_pkt.seq_num))) {
-			ack_pkt.seq_num = htonl(rn);
-			ack_pkt.selective_acks = htonl(selective_acks);
-			sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
-
-			// Packet inside window arrived.
-		} else {
+		// Packet is inside window.
+		if (is_inside_window(rn, r_size, ntohl(data_pkt.seq_num))) {
 			if (ntohl(data_pkt.seq_num) == rn) {
 
+				// Write packet with seq_num = rn to file.
 				fwrite(data_pkt.data, 1, received_len - sizeof(data_pkt.seq_num), file);
 				fprintf(stderr, RECEIVER "Wrote %ld bytes to file, from packet %d.\n", received_len - sizeof(data_pkt.seq_num), rn);
 				rn = (rn + 1) % SEQ_NUM_SIZE;
 
-				// Update window and send ACK.
+				// Write the following received packets to the file, updating the
+				// window.
 				while ((selective_acks & 1) == 1) {
 					fwrite(data_pkts[rn].data, 1, data_pkts_len[rn] - sizeof(data_pkt.seq_num), file);
 					fprintf(stderr, RECEIVER "Wrote %ld bytes to file, from packet %d.\n", data_pkts_len[rn] - sizeof(data_pkt.seq_num), rn);
@@ -187,48 +181,42 @@ int main(int argc, char *argv[]) {
 
 				selective_acks >>= 1;
 
-				ack_pkt.seq_num = htonl(rn);
-				ack_pkt.selective_acks = htonl(selective_acks);
-				sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
-
 			} else {
+				// Mark packet as received and store it.
 				if (!has_been_received(ntohl(data_pkt.seq_num), rn, selective_acks)) {
-					// Mark as received and send ACK.
 					selective_acks |= 1 << (ntohl(data_pkt.seq_num) - rn - 1);
 
-					ack_pkt.seq_num = htonl(rn);
-					ack_pkt.selective_acks = htonl(selective_acks);
-					sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
-
-					// Store packet and its length.
 					data_pkts[ntohl(data_pkt.seq_num)] = data_pkt;
 					data_pkts_len[ntohl(data_pkt.seq_num)] = received_len;
-
-				} else {
-					// Send ACK.
-					ack_pkt.seq_num = htonl(rn);
-					ack_pkt.selective_acks = htonl(selective_acks);
-					sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
 				}
 			}
 		}
 
-	} while (received_len == sizeof(data_pkt_t) || selective_acks != 0);
-
-	// Clean up and exit.
-	while (true) {
-		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
-		if (received_len == -1) {
-			break;
-		}
+		// Send ACK.
+		ack_pkt.seq_num = htonl(rn);
+		ack_pkt.selective_acks = htonl(selective_acks);
 		sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
+
+	} while (received_len == sizeof(data_pkt_t) || ntohl(data_pkt.seq_num) != rn - 1 || selective_acks != 0);
+
+	tv.tv_sec = 2;
+	tv.tv_usec = 0;
+	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
+		fprintf(stderr, RECEIVER "Failed to set timeout.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
+	while (received_len != -1) {
+		sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
+		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
 	}
 
 	// Clean up and exit.
 	close(sockfd);
-	fprintf(stderr, RECEIVER "Closing socket.\n");
+	fprintf(stderr, RECEIVER "Closed socket.\n");
 	fclose(file);
-	fprintf(stderr, RECEIVER "Closing file.\n");
+	fprintf(stderr, RECEIVER "Closed file.\n");
 
-	return 0;
+	exit(EXIT_SUCCESS);
 }
