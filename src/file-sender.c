@@ -160,16 +160,18 @@ int main(int argc, char *argv[]) {
 			selective_acks = ntohl(ack_pkt.selective_acks);
 
 			if (received_len == -1) {
+				// Exit on 3 consecutive timouts
+				if (++timeouts == MAX_RETRIES) {
+					fprintf(stderr, SENDER "Exiting: Consecutive timeouts.\n");
+					close(sockfd);
+					fclose(file);
+					exit(EXIT_FAILURE);
+				}
+
 				// Resend all not yet acknowledged outstanding packets.
 				for (uint32_t seq_num = sf; !has_been_received(seq_num, rn, selective_acks) && is_outstanding_packet(sn, sf, seq_num); seq_num = (seq_num + 1) % SEQ_NUM_SIZE) {
 					fprintf(stderr, SENDER "Timeout:\n");
 					send_data_packet(sockfd, &data_pkts[seq_num], offsetof(data_pkt_t, data) + data_pkts_len[seq_num], (struct sockaddr *)&client_addr);
-				}
-
-				// Exit on 3 consecutive timouts
-				if (++timeouts == MAX_RETRIES) {
-					fprintf(stderr, SENDER "Exiting: Consecutive timeouts.\n");
-					exit(EXIT_FAILURE);
 				}
 
 			} else {

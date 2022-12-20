@@ -24,4 +24,7 @@ clean::
 tests:: $(TARGETS) bin/log-packets.so
 	(./tests/run.sh)
 
+copy::
+	(cp src/file-sender.c src/file-receiver.c ~/downloads/ist199115-proj1)
+
 -include $(wildcard *.d)

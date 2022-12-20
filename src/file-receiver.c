@@ -132,7 +132,7 @@ int main(int argc, char *argv[]) {
 
 	// Set timeout.
 	struct timeval tv;
-	tv.tv_sec = 4;
+	tv.tv_sec = 2;
 	tv.tv_usec = 0;
 	if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1) {
 		fprintf(stderr, RECEIVER "Failed to set timeout.\n");
@@ -153,6 +153,9 @@ int main(int argc, char *argv[]) {
 	do {
 		// Receive data packet.
 		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
+		if (received_len == -1) {
+			received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
+		}
 		if (received_len == -1) {
 			fprintf(stderr, RECEIVER "Timeout has been reached.\n");
 			fclose(file);
@@ -211,6 +214,15 @@ int main(int argc, char *argv[]) {
 		}
 
 	} while (received_len == sizeof(data_pkt_t) || selective_acks != 0);
+
+	// Clean up and exit.
+	while (true) {
+		received_len = receive_data_packet(sockfd, &data_pkt, (struct sockaddr *)&src_addr, &(socklen_t){sizeof(src_addr)});
+		if (received_len == -1) {
+			break;
+		}
+		sent_len = send_ack_packet(sockfd, &ack_pkt, sizeof(ack_pkt), (struct sockaddr *)&src_addr);
+	}
 
 	// Clean up and exit.
 	close(sockfd);
