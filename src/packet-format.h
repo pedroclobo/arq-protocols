@@ -1,4 +1,3 @@
-#include <stddef.h>
 #include <stdint.h>
 
 #define MAX_WINDOW_SIZE 32
@@ -6,7 +5,6 @@
 #define MAX_RETRIES 3
 #define MAX_CHUNK_SIZE 1000
 #define MAX_PATH_SIZE 4096
-#define SEQ_NUM_SIZE (MAX_WINDOW_SIZE * 2)
 
 typedef struct __attribute__((__packed__)) req_file_pkt_t {
 	char file_path[MAX_PATH_SIZE];
@@ -21,8 +19,3 @@ typedef struct __attribute__((__packed__)) ack_pkt_t {
 	uint32_t seq_num;
 	uint32_t selective_acks;
 } ack_pkt_t;
-
-struct data_pkt {
-	struct data_pkt_t pkt;
-	size_t len;
-};
